@@ -1,0 +1,110 @@
+name: minecraft-base
+schemaVersion: 1.0
+phases:
+  - name: build
+    steps:
+      - name: install_packages
+        action: ExecuteBash
+        inputs:
+          commands:
+            - |
+              set -euxo pipefail
+              dnf -y update
+              dnf -y install java-21-amazon-corretto-headless jq tar unzip logrotate
+      - name: create_user_dirs
+        action: ExecuteBash
+        inputs:
+          commands:
+            - |
+              id -u minecraft 2>/dev/null || useradd --system --home /opt/minecraft --shell /sbin/nologin minecraft
+              mkdir -p /opt/minecraft/{logs,bin}
+              chown -R minecraft:minecraft /opt/minecraft
+      - name: write_launch_script
+        action: CreateFile
+        inputs:
+          - path: /opt/minecraft/bin/launch.sh
+            permissions: '0755'
+            owner: root
+            group: root
+            content: |
+              #!/usr/bin/env bash
+              set -euo pipefail
+              MC_DIR=/opt/minecraft
+              UA="mc-ec2-imagebuilder/1.0 ([email protected])"
+              # Load runtime overrides (version, heap, flags)
+              if [ -f /etc/minecraft/minecraft.env ]; then
+                set -a; . /etc/minecraft/minecraft.env; set +a
+              fi
+              : "${MC_VERSION:=1.21.8}"
+              : "${JAVA_HEAP:=2G}"
+              : "${AIKAR_FLAGS:=-XX:+UnlockExperimentalVMOptions -XX:+UseG1GC -XX:G1NewSizePercent=30 -XX:G1MaxNewSizePercent=40 -XX:G1HeapRegionSize=8M -XX:G1ReservePercent=20 -XX:MaxGCPauseMillis=200 -XX:G1MixedGCCountTarget=4 -XX:G1MixedGCLiveThresholdPercent=90 -XX:InitiatingHeapOccupancyPercent=15 -XX:G1RSetUpdatingPauseTimePercent=5 -XX:SurvivorRatio=32 -XX:+PerfDisableSharedMem -XX:MaxTenuringThreshold=1}"
+              mkdir -p "$MC_DIR"
+              # Download Paper server.jar (stable build) if missing
+              if [ ! -f "$MC_DIR/server.jar" ]; then
+                URL=$(curl -fsSL -H "User-Agent: $UA" "https://fill.papermc.io/v3/projects/paper/versions/${MC_VERSION}/builds" | jq -r 'first(.[] | select(.channel=="STABLE") | .downloads."server:default".url)')
+                curl -fSL -H "User-Agent: $UA" -o "$MC_DIR/server.jar" "$URL"
+              fi
+              [ -f "$MC_DIR/eula.txt" ] || echo "eula=true" > "$MC_DIR/eula.txt"
+              exec /usr/bin/java -Xms${JAVA_HEAP} -Xmx${JAVA_HEAP} ${AIKAR_FLAGS} -jar "$MC_DIR/server.jar" nogui
+      - name: write_systemd
+        action: CreateFile
+        inputs:
+          - path: /etc/systemd/system/minecraft.service
+            permissions: '0644'
+            owner: root
+            group: root
+            content: |
+              [Unit]
+              Description=Paper Minecraft Server
+              After=network.target
+              Wants=network-online.target
+
+              [Service]
+              EnvironmentFile=-/etc/minecraft/minecraft.env
+              WorkingDirectory=/opt/minecraft
+              ExecStart=/opt/minecraft/bin/launch.sh
+              Restart=always
+              RestartSec=10
+              SuccessExitStatus=0 1 143
+              User=minecraft
+              UMask=027
+              NoNewPrivileges=yes
+              PrivateTmp=yes
+              ProtectSystem=strict
+              ProtectHome=read-only
+              ProtectClock=yes
+              ProtectControlGroups=yes
+              ProtectKernelModules=yes
+              ProtectKernelTunables=yes
+              RestrictSUIDSGID=yes
+              RestrictNamespaces=yes
+              LockPersonality=yes
+              CapabilityBoundingSet=
+              AmbientCapabilities=
+              ReadWritePaths=/opt/minecraft /etc/minecraft
+              LimitNOFILE=65535
+
+              [Install]
+              WantedBy=multi-user.target
+      - name: logrotate
+        action: CreateFile
+        inputs:
+          - path: /etc/logrotate.d/minecraft
+            permissions: '0644'
+            owner: root
+            group: root
+            content: |
+              /opt/minecraft/logs/*.log {
+                daily
+                rotate 14
+                compress
+                missingok
+                copytruncate
+              }
+      - name: enable_services
+        action: ExecuteBash
+        inputs:
+          commands:
+            - |
+              systemctl daemon-reload
+              systemctl enable minecraft || true

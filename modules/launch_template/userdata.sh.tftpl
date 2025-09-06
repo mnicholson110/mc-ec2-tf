@@ -1,0 +1,129 @@
+#!/bin/bash
+set -euxo pipefail
+
+
+# Render environment for the service
+install -d -m 0755 /etc/minecraft
+cat > /etc/minecraft/minecraft.env <<EOF_ENV
+MC_VERSION="${mc_version}"
+JAVA_HEAP="${java_heap}"
+# Aikar flags tuned for Paper on Java 21
+AIKAR_FLAGS="-XX:+UnlockExperimentalVMOptions -XX:+UseG1GC -XX:G1NewSizePercent=30 -XX:G1MaxNewSizePercent=40 -XX:G1HeapRegionSize=8M -XX:G1ReservePercent=20 -XX:MaxGCPauseMillis=200 -XX:G1MixedGCCountTarget=4 -XX:G1MixedGCLiveThresholdPercent=90 -XX:InitiatingHeapOccupancyPercent=15 -XX:G1RSetUpdatingPauseTimePercent=5 -XX:SurvivorRatio=32 -XX:+PerfDisableSharedMem -XX:MaxTenuringThreshold=1"
+EOF_ENV
+
+
+# Render server.properties
+install -d -o minecraft -g minecraft -m 0755 /opt/minecraft
+cat > /opt/minecraft/server.properties <<'EOF_PROP'
+online-mode=true
+enable-command-block=${enable_command_block}
+view-distance=${view_distance}
+simulation-distance=${simulation_distance}
+white-list=${whitelist}
+enforce-secure-profile=true
+spawn-protection=16
+max-players=20
+enable-rcon=${enable_rcon}
+broadcast-console-to-ops=true
+allow-flight=false
+enable-status=true
+server-port=25565
+server-ip=
+level-name=world
+level-seed=
+hardcore=false
+pvp=true
+difficulty=normal
+gamemode=survival
+max-world-size=29999984
+sync-chunk-writes=true
+enable-jmx-monitoring=false
+EOF_PROP
+
+# Apply server.properties overrides passed from Terraform
+OVERRIDES_JSON='${server_properties_overrides_json}'
+if [[ -n "$OVERRIDES_JSON" && "$OVERRIDES_JSON" != "{}" ]]; then
+  PROPS_FILE=/opt/minecraft/server.properties
+  while read -r line; do
+    k="$${line%%=*}"
+    v="$${line#*=}"
+    [[ -z "$k" ]] && continue
+    tmp=$(mktemp)
+    awk -v k="$k" -v v="$v" -F'=' '
+      BEGIN{OFS="="; found=0}
+      $1==k {print k, v; found=1; next}
+      {print}
+      END{ if (!found) print k"="v }
+    ' "$PROPS_FILE" > "$tmp" && mv "$tmp" "$PROPS_FILE"
+  done < <(jq -r 'to_entries[] | "\(.key)=\(.value)"' <<<"$OVERRIDES_JSON")
+fi
+
+chown minecraft:minecraft /opt/minecraft/server.properties || true
+
+
+# Pre-seed ops.json and whitelist.json before first start
+# Inputs are provided as JSON arrays via template variables
+OPS_NAMES_JSON='${ops_usernames_json}'
+WL_NAMES_JSON='${whitelist_usernames_json}'
+
+fetch_uuid() {
+  # Resolve UUID for a given Minecraft username via Mojang API
+  # Prints UUID (no dashes) or empty string on failure
+  local name="$1"
+  # Escape Terraform interpolation for bash variable $name
+  local url="https://api.mojang.com/users/profiles/minecraft/$${name}"
+  local id
+  id=$(curl -fsSL --connect-timeout 5 --max-time 10 "$url" | jq -r '.id // empty' || true)
+  # Mojang returns UUIDs without dashes; Minecraft expects dashed UUIDs
+  if [[ $${#id} -eq 32 ]]; then
+    echo -n "$${id:0:8}-$${id:8:4}-$${id:12:4}-$${id:16:4}-$${id:20:12}"
+  else
+    echo -n "$id"
+  fi
+}
+
+install -d -o minecraft -g minecraft -m 0755 /opt/minecraft
+
+# Seed whitelist if entries provided and whitelist is enabled
+if [[ -n "${whitelist}" && "${whitelist}" == "true" && "$${WL_NAMES_JSON}" != "[]" ]]; then
+  echo "[]" > /opt/minecraft/whitelist.json.tmp
+  while IFS= read -r name; do
+    [[ -z "$name" ]] && continue
+    uuid=$(fetch_uuid "$name") || true
+    if [[ -n "$uuid" ]]; then
+      tmp=$(mktemp)
+      jq --arg name "$name" --arg uuid "$uuid" '. + [{"uuid":$uuid,"name":$name}]' \
+        /opt/minecraft/whitelist.json.tmp > "$tmp" && mv "$tmp" /opt/minecraft/whitelist.json.tmp
+    else
+      echo "WARN: could not resolve UUID for whitelist name '$name'" >&2
+    fi
+  done < <(jq -r '.[]' <<<"$WL_NAMES_JSON")
+  mv /opt/minecraft/whitelist.json.tmp /opt/minecraft/whitelist.json
+  chown minecraft:minecraft /opt/minecraft/whitelist.json || true
+fi
+
+# Seed ops with level 4 if entries provided
+if [[ "$${OPS_NAMES_JSON}" != "[]" ]]; then
+  echo "[]" > /opt/minecraft/ops.json.tmp
+  while IFS= read -r name; do
+    [[ -z "$name" ]] && continue
+    uuid=$(fetch_uuid "$name") || true
+    if [[ -n "$uuid" ]]; then
+      tmp=$(mktemp)
+      jq --arg name "$name" --arg uuid "$uuid" '. + [{"uuid":$uuid,"name":$name,"level":4,"bypassesPlayerLimit":false}]' \
+        /opt/minecraft/ops.json.tmp > "$tmp" && mv "$tmp" /opt/minecraft/ops.json.tmp
+    else
+      echo "WARN: could not resolve UUID for ops name '$name'" >&2
+    fi
+  done < <(jq -r '.[]' <<<"$OPS_NAMES_JSON")
+  mv /opt/minecraft/ops.json.tmp /opt/minecraft/ops.json
+  chown minecraft:minecraft /opt/minecraft/ops.json || true
+fi
+
+
+# Ensure and (re)start the service
+systemctl daemon-reload
+systemctl enable --now minecraft
+# one more restart so freshly rendered props/env are in effect even if service auto-started earlier
+sleep 2
+systemctl restart minecraft || true
