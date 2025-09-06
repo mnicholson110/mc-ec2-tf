@@ -10,7 +10,7 @@ phases:
             - |
               set -euxo pipefail
               dnf -y update
-              dnf -y install java-21-amazon-corretto-headless jq tar unzip logrotate
+              dnf -y install java-21-amazon-corretto-headless jq tar unzip logrotate awscli
       - name: create_user_dirs
         action: ExecuteBash
         inputs:
@@ -19,6 +19,14 @@ phases:
               id -u minecraft 2>/dev/null || useradd --system --home /opt/minecraft --shell /sbin/nologin minecraft
               mkdir -p /opt/minecraft/{logs,bin}
               chown -R minecraft:minecraft /opt/minecraft
+      - name: create_config_dir
+        action: ExecuteBash
+        inputs:
+          commands:
+            - |
+              set -euxo pipefail
+              # Ensure config dir exists so systemd ReadWritePaths for /etc/minecraft doesn't fail
+              mkdir -p /etc/minecraft
       - name: write_launch_script
         action: CreateFile
         inputs:

@@ -15,6 +15,12 @@ variable "subnet_id" {
   default     = ""
 }
 
+variable "private_ip_address" {
+  description = "Optional fixed private IPv4 to assign to the instance's primary interface. Must be within the selected subnet and free at launch."
+  type        = string
+  default     = ""
+}
+
 variable "instance_type" {
   description = "EC2 instance type for the Minecraft server"
   type        = string
@@ -58,6 +64,88 @@ variable "name_prefix" {
   description = "Name tag / prefix for resources"
   type        = string
   default     = "minecraft"
+}
+
+
+# ---- ASG sizing ----
+variable "asg_min_size" {
+  description = "Minimum number of instances in the ASG"
+  type        = number
+  default     = 0
+}
+
+variable "asg_max_size" {
+  description = "Maximum number of instances in the ASG"
+  type        = number
+  default     = 1
+}
+
+variable "asg_desired_capacity" {
+  description = "Desired number of instances in the ASG"
+  type        = number
+  default     = 0
+}
+
+# Explicit launch template version used by the ASG.
+# Accepts a numeric version (e.g., "1") or special values like "$Latest" or "$Default".
+variable "asg_launch_template_version" {
+  description = "Launch template version for the ASG (e.g., \"1\", \"$Latest\", or \"$Default\")."
+  type        = string
+  default     = "$Latest"
+}
+
+# ---- Persistent data volume ----
+variable "data_volume_enabled" {
+  description = "Create and attach a persistent EBS volume for /opt/minecraft"
+  type        = bool
+  default     = true
+}
+
+variable "data_volume_size_gb" {
+  description = "Data volume size (GiB)"
+  type        = number
+  default     = 40
+}
+
+variable "data_volume_type" {
+  description = "EBS volume type for data disk"
+  type        = string
+  default     = "gp3"
+}
+
+variable "data_volume_iops" {
+  description = "IOPS for gp3/io1/io2 volumes (optional)"
+  type        = number
+  default     = 3000
+}
+
+variable "data_volume_throughput" {
+  description = "Throughput (MiB/s) for gp3 volumes (optional)"
+  type        = number
+  default     = 125
+}
+
+variable "data_volume_device_name" {
+  description = "Linux device name to attach the data volume as (kernel may remap to NVMe)"
+  type        = string
+  default     = "/dev/sdf"
+}
+
+
+ 
+
+
+# ---- Optional Elastic IP (stable public IP) ----
+variable "eip_enabled" {
+  description = "Allocate and associate an Elastic IP to the instance at boot for a stable public IP"
+  type        = bool
+  default     = false
+}
+
+variable "eip_allocation_id" {
+  description = "Optional existing EIP allocation ID to use. Leave blank to have Terraform allocate one when eip_enabled is true."
+  type        = string
+  default     = ""
 }
 
 

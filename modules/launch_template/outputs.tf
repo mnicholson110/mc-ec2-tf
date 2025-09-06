@@ -8,3 +8,7 @@ output "security_group_id" {
   value       = aws_security_group.mc.id
 }
 
+output "launch_template_latest_version" {
+  description = "Launch template latest version"
+  value       = aws_launch_template.mc.latest_version
+}

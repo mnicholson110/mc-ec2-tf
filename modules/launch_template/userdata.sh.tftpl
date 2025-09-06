@@ -12,14 +12,144 @@ AIKAR_FLAGS="-XX:+UnlockExperimentalVMOptions -XX:+UseG1GC -XX:G1NewSizePercent=
 EOF_ENV
 
 
-# Render server.properties
+# Prevent the service from auto-starting against an unmounted data dir
+systemctl stop minecraft || true
+
+
+# Ensure base dir exists
+# Ensure data dir mountpoint exists (world/configs live here)
 install -d -o minecraft -g minecraft -m 0755 /opt/minecraft
+
+# Cache instance-id for later ops (with IMDSv2 retries)
+get_imds_token() {
+  local t=""
+  for i in {1..10}; do
+    t=$(curl -fsS -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" || true)
+    [[ -n "$t" ]] && break
+    sleep 1
+  done
+  echo -n "$t"
+}
+
+TOKEN=$(get_imds_token)
+INSTANCE_ID=$(curl -fsS --retry 5 -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+AZ=$(curl -fsS --retry 5 -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/availability-zone)
+
+NAME_PREFIX="${name_prefix}"
+
+# Associate Elastic IP (if enabled)
+if [[ "${eip_enabled}" == "true" ]]; then
+  ALLOC_ID="${eip_allocation_id}"
+  if [[ -z "$ALLOC_ID" ]]; then
+    # Try to resolve allocation-id by tag Name
+    ALLOC_ID=$(aws ec2 describe-addresses \
+      --filters Name=tag:Name,Values="$NAME_PREFIX-eip" \
+      --query 'Addresses[0].AllocationId' --output text 2>/dev/null || true)
+  fi
+
+  if [[ -n "$ALLOC_ID" && "$ALLOC_ID" != "None" ]]; then
+    # If already associated elsewhere, disassociate first
+    ASSOC_ID=$(aws ec2 describe-addresses --allocation-ids "$ALLOC_ID" --query 'Addresses[0].AssociationId' --output text 2>/dev/null || true)
+    ASSOC_INST=$(aws ec2 describe-addresses --allocation-ids "$ALLOC_ID" --query 'Addresses[0].InstanceId' --output text 2>/dev/null || true)
+    if [[ -n "$ASSOC_ID" && "$ASSOC_ID" != "None" && "$ASSOC_INST" != "$INSTANCE_ID" ]]; then
+      aws ec2 disassociate-address --association-id "$ASSOC_ID" || true
+      # small wait for disassociation to propagate
+      sleep 2
+    fi
+    # Associate to this instance's primary interface
+    aws ec2 associate-address --allocation-id "$ALLOC_ID" --instance-id "$INSTANCE_ID" || true
+  else
+    echo "WARN: EIP enabled but allocation-id could not be resolved" >&2
+  fi
+fi
+
+ 
+
+# Attach and mount persistent data volume if enabled
+DATA_VOL_ID="${data_volume_id}"
+if [[ "${data_volume_enabled}" == "true" && -z "$DATA_VOL_ID" ]]; then
+  DATA_VOL_ID=$(aws ec2 describe-volumes \
+    --filters Name=tag:Name,Values="$NAME_PREFIX-data" Name=availability-zone,Values="$AZ" \
+    --query 'Volumes[0].VolumeId' --output text 2>/dev/null || true)
+fi
+# Normalize possible 'None' output from --output text
+if [[ "$DATA_VOL_ID" == "None" ]]; then DATA_VOL_ID=""; fi
+
+if [[ "${data_volume_enabled}" == "true" && -n "$DATA_VOL_ID" ]]; then
+  # Wait for volume to be free if attached elsewhere, then attach with retries
+  set +e
+  for i in {1..120}; do
+    VOL_JSON=$(aws ec2 describe-volumes --volume-ids "$DATA_VOL_ID" --query 'Volumes[0].{State:State,AttachInst:Attachments[0].InstanceId,AttachState:Attachments[0].State}' --output json 2>/dev/null || echo '{}')
+    VOL_STATE=$(jq -r '.State // empty' <<<"$VOL_JSON")
+    VOL_ATTACH_INST=$(jq -r '.AttachInst // empty' <<<"$VOL_JSON")
+    VOL_ATTACH_STATE=$(jq -r '.AttachState // empty' <<<"$VOL_JSON")
+    # Break if available or already attached to this instance
+    if [[ "$VOL_STATE" == "available" || "$VOL_ATTACH_INST" == "$INSTANCE_ID" ]]; then
+      break
+    fi
+    sleep 5
+  done
+
+  # If not attached to this instance, attempt attach with retries (handles VolumeInUse race)
+  if [[ "$VOL_ATTACH_INST" != "$INSTANCE_ID" ]]; then
+    for i in {1..30}; do
+      aws ec2 attach-volume --volume-id "$DATA_VOL_ID" --instance-id "$INSTANCE_ID" --device "${data_volume_device_name}"
+      ATTACH_RC=$?
+      if [[ $ATTACH_RC -eq 0 ]]; then
+        break
+      fi
+      sleep 5
+    done
+  fi
+
+  # Wait until attachment state is 'attached'
+  for i in {1..60}; do
+    STATE=$(aws ec2 describe-volumes --volume-ids "$DATA_VOL_ID" --query 'Volumes[0].Attachments[0].State' --output text 2>/dev/null || echo "")
+    [[ "$STATE" == "attached" ]] && break
+    sleep 2
+  done
+  set -e
+
+  # Resolve device path by volume id symlink
+  DEV_SYMLINK="/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_$DATA_VOL_ID"
+  for i in {1..60}; do
+    [[ -e "$DEV_SYMLINK" ]] && break
+    sleep 2
+    udevadm settle || true
+  done
+  if [[ -e "$DEV_SYMLINK" ]]; then
+    DEV=$(readlink -f "$DEV_SYMLINK")
+  else
+    # Fallback to expected kernel name
+    DEV="${data_volume_device_name}"
+  fi
+
+  # Proceed only if the device exists and is a block device
+  if [[ -b "$DEV" ]]; then
+    # Make filesystem if missing
+    if ! blkid -o value -s TYPE "$DEV" >/dev/null 2>&1; then
+      mkfs.ext4 -F "$DEV"
+    fi
+
+    # Mount via UUID for stability
+    VOL_UUID=$(blkid -o value -s UUID "$DEV")
+    grep -q "^UUID=$VOL_UUID" /etc/fstab || echo "UUID=$VOL_UUID /opt/minecraft ext4 defaults,nofail 0 2" >> /etc/fstab
+    mount -a || mount "$DEV" /opt/minecraft || true
+    chown -R minecraft:minecraft /opt/minecraft || true
+  else
+    echo "WARN: Device for data volume not present; skipping mount" >&2
+  fi
+fi
+
+# With data volume mounted, render server.properties only if it does not already exist
+if [[ ! -f /opt/minecraft/server.properties ]]; then
 cat > /opt/minecraft/server.properties <<'EOF_PROP'
 online-mode=true
 enable-command-block=${enable_command_block}
 view-distance=${view_distance}
 simulation-distance=${simulation_distance}
 white-list=${whitelist}
+enforce-whitelist=${whitelist}
 enforce-secure-profile=true
 spawn-protection=16
 max-players=20
@@ -39,6 +169,7 @@ max-world-size=29999984
 sync-chunk-writes=true
 enable-jmx-monitoring=false
 EOF_PROP
+fi
 
 # Apply server.properties overrides passed from Terraform
 OVERRIDES_JSON='${server_properties_overrides_json}'
@@ -61,7 +192,11 @@ fi
 chown minecraft:minecraft /opt/minecraft/server.properties || true
 
 
-# Pre-seed ops.json and whitelist.json before first start
+#!/bin/bash
+set -euxo pipefail
+
+
+# Pre-seed or reconcile ops.json and whitelist.json on boot
 # Inputs are provided as JSON arrays via template variables
 OPS_NAMES_JSON='${ops_usernames_json}'
 WL_NAMES_JSON='${whitelist_usernames_json}'
@@ -84,46 +219,119 @@ fetch_uuid() {
 
 install -d -o minecraft -g minecraft -m 0755 /opt/minecraft
 
-# Seed whitelist if entries provided and whitelist is enabled
-if [[ -n "${whitelist}" && "${whitelist}" == "true" && "$${WL_NAMES_JSON}" != "[]" ]]; then
-  echo "[]" > /opt/minecraft/whitelist.json.tmp
+# Build desired whitelist array from WL_NAMES_JSON (if any)
+DESIRED_WL_TMP=$(mktemp)
+echo "[]" > "$DESIRED_WL_TMP"
+if [[ "$${WL_NAMES_JSON}" != "[]" ]]; then
   while IFS= read -r name; do
     [[ -z "$name" ]] && continue
     uuid=$(fetch_uuid "$name") || true
     if [[ -n "$uuid" ]]; then
-      tmp=$(mktemp)
-      jq --arg name "$name" --arg uuid "$uuid" '. + [{"uuid":$uuid,"name":$name}]' \
-        /opt/minecraft/whitelist.json.tmp > "$tmp" && mv "$tmp" /opt/minecraft/whitelist.json.tmp
+      t=$(mktemp)
+      jq --arg name "$name" --arg uuid "$uuid" '. + [{"uuid":$uuid,"name":$name}]' "$DESIRED_WL_TMP" > "$t" && mv "$t" "$DESIRED_WL_TMP"
     else
       echo "WARN: could not resolve UUID for whitelist name '$name'" >&2
     fi
   done < <(jq -r '.[]' <<<"$WL_NAMES_JSON")
-  mv /opt/minecraft/whitelist.json.tmp /opt/minecraft/whitelist.json
-  chown minecraft:minecraft /opt/minecraft/whitelist.json || true
 fi
 
-# Seed ops with level 4 if entries provided
+# Replace whitelist.json with desired (always write, even if empty) when whitelist toggled true
+if [[ "${whitelist}" == "true" ]]; then
+  mv "$DESIRED_WL_TMP" /opt/minecraft/whitelist.json
+  chown minecraft:minecraft /opt/minecraft/whitelist.json || true
+else
+  rm -f "$DESIRED_WL_TMP" || true
+fi
+
+# Build desired ops array from OPS_NAMES_JSON (if any); always replace
+DESIRED_OPS_TMP=$(mktemp)
+echo "[]" > "$DESIRED_OPS_TMP"
 if [[ "$${OPS_NAMES_JSON}" != "[]" ]]; then
-  echo "[]" > /opt/minecraft/ops.json.tmp
   while IFS= read -r name; do
     [[ -z "$name" ]] && continue
     uuid=$(fetch_uuid "$name") || true
     if [[ -n "$uuid" ]]; then
-      tmp=$(mktemp)
-      jq --arg name "$name" --arg uuid "$uuid" '. + [{"uuid":$uuid,"name":$name,"level":4,"bypassesPlayerLimit":false}]' \
-        /opt/minecraft/ops.json.tmp > "$tmp" && mv "$tmp" /opt/minecraft/ops.json.tmp
+      t=$(mktemp)
+      jq --arg name "$name" --arg uuid "$uuid" '. + [{"uuid":$uuid,"name":$name,"level":4,"bypassesPlayerLimit":false}]' "$DESIRED_OPS_TMP" > "$t" && mv "$t" "$DESIRED_OPS_TMP"
     else
       echo "WARN: could not resolve UUID for ops name '$name'" >&2
     fi
   done < <(jq -r '.[]' <<<"$OPS_NAMES_JSON")
-  mv /opt/minecraft/ops.json.tmp /opt/minecraft/ops.json
-  chown minecraft:minecraft /opt/minecraft/ops.json || true
+fi
+mv "$DESIRED_OPS_TMP" /opt/minecraft/ops.json
+chown minecraft:minecraft /opt/minecraft/ops.json || true
+
+
+# Ensure application binaries live outside the data mount and override systemd
+# App dir contains server.jar and launch script; data stays under /opt/minecraft
+install -d -o minecraft -g minecraft -m 0755 /opt/mc-app
+cat > /opt/mc-app/launch.sh <<'EOF_LAUNCH'
+#!/usr/bin/env bash
+set -euo pipefail
+APP_DIR=/opt/mc-app
+MC_DIR=/opt/minecraft
+UA="mc-ec2-userdata/1.0 ([email protected])"
+
+# Load runtime overrides (version, heap, flags)
+if [ -f /etc/minecraft/minecraft.env ]; then
+  set -a; . /etc/minecraft/minecraft.env; set +a
+fi
+: "$${MC_VERSION:=1.21.8}"
+: "$${JAVA_HEAP:=2G}"
+: "$${AIKAR_FLAGS:=-XX:+UnlockExperimentalVMOptions -XX:+UseG1GC -XX:G1NewSizePercent=30 -XX:G1MaxNewSizePercent=40 -XX:G1HeapRegionSize=8M -XX:G1ReservePercent=20 -XX:MaxGCPauseMillis=200 -XX:G1MixedGCCountTarget=4 -XX:G1MixedGCLiveThresholdPercent=90 -XX:InitiatingHeapOccupancyPercent=15 -XX:G1RSetUpdatingPauseTimePercent=5 -XX:SurvivorRatio=32 -XX:+PerfDisableSharedMem -XX:MaxTenuringThreshold=1}"
+
+mkdir -p "$APP_DIR" "$MC_DIR"
+
+resolve_paper_url() {
+  local ver="$1"
+  local url=""
+  # Try requested version first
+  url=$(curl -fsSL -H "User-Agent: $UA" "https://fill.papermc.io/v3/projects/paper/versions/$ver/builds" \
+        | jq -r 'first(.[] | select(.channel=="STABLE") | .downloads."server:default".url) // empty' || true)
+  if [[ -z "$url" ]]; then
+    # Fallback: get latest listed version then pick latest stable build
+    latest_ver=$(curl -fsSL -H "User-Agent: $UA" "https://fill.papermc.io/v3/projects/paper" | jq -r '.versions[-1] // empty' || true)
+    if [[ -n "$latest_ver" ]]; then
+      url=$(curl -fsSL -H "User-Agent: $UA" "https://fill.papermc.io/v3/projects/paper/versions/$latest_ver/builds" \
+            | jq -r 'first(.[] | select(.channel=="STABLE") | .downloads."server:default".url) // empty' || true)
+      echo "Using latest available Paper version: $latest_ver" >&2
+    fi
+  fi
+  echo -n "$url"
+}
+
+# Download Paper server.jar (stable build) into app dir if missing
+if [ ! -f "$APP_DIR/server.jar" ]; then
+  URL=$(resolve_paper_url "$MC_VERSION")
+  if [[ -z "$URL" ]]; then
+    echo "ERROR: Could not resolve Paper download URL for version '$MC_VERSION' or latest." >&2
+    exit 1
+  fi
+  curl -fSL -H "User-Agent: $UA" -o "$APP_DIR/server.jar" "$URL"
 fi
 
+# Accept EULA in data dir
+[ -f "$MC_DIR/eula.txt" ] || echo "eula=true" > "$MC_DIR/eula.txt"
 
-# Ensure and (re)start the service
+# Run with working directory set by systemd to $MC_DIR
+exec /usr/bin/java -Xms$${JAVA_HEAP} -Xmx$${JAVA_HEAP} $${AIKAR_FLAGS} -jar "$APP_DIR/server.jar" nogui
+EOF_LAUNCH
+chmod 0755 /opt/mc-app/launch.sh
+chown minecraft:minecraft /opt/mc-app/launch.sh
+
+# Systemd drop-in to point ExecStart to /opt/mc-app and ensure correct working dir
+install -d -m 0755 /etc/systemd/system/minecraft.service.d
+cat > /etc/systemd/system/minecraft.service.d/override.conf <<'EOF_SD'
+[Service]
+WorkingDirectory=/opt/minecraft
+ExecStart=
+ExecStart=/opt/mc-app/launch.sh
+# Allow writes to both data and app directories under ProtectSystem=strict
+ReadWritePaths=/opt/minecraft /etc/minecraft /opt/mc-app
+EOF_SD
+
+# Ensure and (re)start the service after overrides and data prep
 systemctl daemon-reload
-systemctl enable --now minecraft
-# one more restart so freshly rendered props/env are in effect even if service auto-started earlier
+systemctl enable --now minecraft || true
 sleep 2
 systemctl restart minecraft || true
