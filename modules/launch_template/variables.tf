@@ -27,12 +27,3 @@ variable "whitelist_usernames" { type = list(string) }
 variable "data_volume_enabled" { type = bool }
 variable "data_volume_id" { type = string }
 variable "data_volume_device_name" { type = string }
-
- 
-
-# Optional EIP association
-variable "eip_enabled" { type = bool }
-variable "eip_allocation_id" {
-  type    = string
-  default = ""
-}

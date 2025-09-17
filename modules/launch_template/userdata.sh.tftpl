@@ -20,121 +20,32 @@ systemctl stop minecraft || true
 # Ensure data dir mountpoint exists (world/configs live here)
 install -d -o minecraft -g minecraft -m 0755 /opt/minecraft
 
-# Cache instance-id for later ops (with IMDSv2 retries)
-get_imds_token() {
-  local t=""
-  for i in {1..10}; do
-    t=$(curl -fsS -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" || true)
-    [[ -n "$t" ]] && break
-    sleep 1
-  done
-  echo -n "$t"
-}
-
-TOKEN=$(get_imds_token)
-INSTANCE_ID=$(curl -fsS --retry 5 -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
-AZ=$(curl -fsS --retry 5 -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/availability-zone)
-
-NAME_PREFIX="${name_prefix}"
-
-# Associate Elastic IP (if enabled)
-if [[ "${eip_enabled}" == "true" ]]; then
-  ALLOC_ID="${eip_allocation_id}"
-  if [[ -z "$ALLOC_ID" ]]; then
-    # Try to resolve allocation-id by tag Name
-    ALLOC_ID=$(aws ec2 describe-addresses \
-      --filters Name=tag:Name,Values="$NAME_PREFIX-eip" \
-      --query 'Addresses[0].AllocationId' --output text 2>/dev/null || true)
-  fi
-
-  if [[ -n "$ALLOC_ID" && "$ALLOC_ID" != "None" ]]; then
-    # If already associated elsewhere, disassociate first
-    ASSOC_ID=$(aws ec2 describe-addresses --allocation-ids "$ALLOC_ID" --query 'Addresses[0].AssociationId' --output text 2>/dev/null || true)
-    ASSOC_INST=$(aws ec2 describe-addresses --allocation-ids "$ALLOC_ID" --query 'Addresses[0].InstanceId' --output text 2>/dev/null || true)
-    if [[ -n "$ASSOC_ID" && "$ASSOC_ID" != "None" && "$ASSOC_INST" != "$INSTANCE_ID" ]]; then
-      aws ec2 disassociate-address --association-id "$ASSOC_ID" || true
-      # small wait for disassociation to propagate
-      sleep 2
-    fi
-    # Associate to this instance's primary interface
-    aws ec2 associate-address --allocation-id "$ALLOC_ID" --instance-id "$INSTANCE_ID" || true
-  else
-    echo "WARN: EIP enabled but allocation-id could not be resolved" >&2
-  fi
-fi
-
- 
-
-# Attach and mount persistent data volume if enabled
-DATA_VOL_ID="${data_volume_id}"
-if [[ "${data_volume_enabled}" == "true" && -z "$DATA_VOL_ID" ]]; then
-  DATA_VOL_ID=$(aws ec2 describe-volumes \
-    --filters Name=tag:Name,Values="$NAME_PREFIX-data" Name=availability-zone,Values="$AZ" \
-    --query 'Volumes[0].VolumeId' --output text 2>/dev/null || true)
-fi
-# Normalize possible 'None' output from --output text
-if [[ "$DATA_VOL_ID" == "None" ]]; then DATA_VOL_ID=""; fi
-
-if [[ "${data_volume_enabled}" == "true" && -n "$DATA_VOL_ID" ]]; then
-  # Wait for volume to be free if attached elsewhere, then attach with retries
-  set +e
-  for i in {1..120}; do
-    VOL_JSON=$(aws ec2 describe-volumes --volume-ids "$DATA_VOL_ID" --query 'Volumes[0].{State:State,AttachInst:Attachments[0].InstanceId,AttachState:Attachments[0].State}' --output json 2>/dev/null || echo '{}')
-    VOL_STATE=$(jq -r '.State // empty' <<<"$VOL_JSON")
-    VOL_ATTACH_INST=$(jq -r '.AttachInst // empty' <<<"$VOL_JSON")
-    VOL_ATTACH_STATE=$(jq -r '.AttachState // empty' <<<"$VOL_JSON")
-    # Break if available or already attached to this instance
-    if [[ "$VOL_STATE" == "available" || "$VOL_ATTACH_INST" == "$INSTANCE_ID" ]]; then
+if [[ "${data_volume_enabled}" == "true" && -n "${data_volume_id}" ]]; then
+  DEV_SYMLINK="/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_${data_volume_id}"
+  ATTACH_DEV=""
+  for i in {1..60}; do
+    if [[ -e "$DEV_SYMLINK" ]]; then
+      ATTACH_DEV=$(readlink -f "$DEV_SYMLINK")
       break
     fi
-    sleep 5
-  done
-
-  # If not attached to this instance, attempt attach with retries (handles VolumeInUse race)
-  if [[ "$VOL_ATTACH_INST" != "$INSTANCE_ID" ]]; then
-    for i in {1..30}; do
-      aws ec2 attach-volume --volume-id "$DATA_VOL_ID" --instance-id "$INSTANCE_ID" --device "${data_volume_device_name}"
-      ATTACH_RC=$?
-      if [[ $ATTACH_RC -eq 0 ]]; then
-        break
-      fi
-      sleep 5
-    done
-  fi
-
-  # Wait until attachment state is 'attached'
-  for i in {1..60}; do
-    STATE=$(aws ec2 describe-volumes --volume-ids "$DATA_VOL_ID" --query 'Volumes[0].Attachments[0].State' --output text 2>/dev/null || echo "")
-    [[ "$STATE" == "attached" ]] && break
-    sleep 2
-  done
-  set -e
-
-  # Resolve device path by volume id symlink
-  DEV_SYMLINK="/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_$DATA_VOL_ID"
-  for i in {1..60}; do
-    [[ -e "$DEV_SYMLINK" ]] && break
+    if [[ -b "${data_volume_device_name}" ]]; then
+      ATTACH_DEV="${data_volume_device_name}"
+      break
+    fi
     sleep 2
     udevadm settle || true
   done
-  if [[ -e "$DEV_SYMLINK" ]]; then
-    DEV=$(readlink -f "$DEV_SYMLINK")
-  else
-    # Fallback to expected kernel name
-    DEV="${data_volume_device_name}"
-  fi
 
-  # Proceed only if the device exists and is a block device
-  if [[ -b "$DEV" ]]; then
-    # Make filesystem if missing
-    if ! blkid -o value -s TYPE "$DEV" >/dev/null 2>&1; then
-      mkfs.ext4 -F "$DEV"
+  [[ -n "$ATTACH_DEV" ]] || ATTACH_DEV="${data_volume_device_name}"
+
+  if [[ -b "$ATTACH_DEV" ]]; then
+    if ! blkid -o value -s TYPE "$ATTACH_DEV" >/dev/null 2>&1; then
+      mkfs.ext4 -F "$ATTACH_DEV"
     fi
 
-    # Mount via UUID for stability
-    VOL_UUID=$(blkid -o value -s UUID "$DEV")
+    VOL_UUID=$(blkid -o value -s UUID "$ATTACH_DEV")
     grep -q "^UUID=$VOL_UUID" /etc/fstab || echo "UUID=$VOL_UUID /opt/minecraft ext4 defaults,nofail 0 2" >> /etc/fstab
-    mount -a || mount "$DEV" /opt/minecraft || true
+    mount -a || mount "$ATTACH_DEV" /opt/minecraft || true
     chown -R minecraft:minecraft /opt/minecraft || true
   else
     echo "WARN: Device for data volume not present; skipping mount" >&2

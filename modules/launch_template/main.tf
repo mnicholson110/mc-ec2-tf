@@ -48,49 +48,7 @@ resource "aws_iam_role_policy_attachment" "ssm" {
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
-# Inline policy to allow attaching the persistent data EBS volume from user-data
-resource "aws_iam_role_policy" "ec2_attach_volume" {
-  count = var.data_volume_enabled ? 1 : 0
-  name  = "${var.name_prefix}-ec2-attach-volume"
-  role  = aws_iam_role.mc.id
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect   = "Allow"
-        Action   = ["ec2:AttachVolume", "ec2:DescribeVolumes", "ec2:DescribeInstances"]
-        Resource = "*"
-      }
-    ]
-  })
-}
-
- 
-
-# Inline policy to allow associating/disassociating a pre-allocated Elastic IP
-resource "aws_iam_role_policy" "ec2_manage_eip" {
-  count = var.eip_enabled ? 1 : 0
-  name  = "${var.name_prefix}-ec2-manage-eip"
-  role  = aws_iam_role.mc.id
-
-  policy = jsonencode({
-    Version = "2012-10-17",
-    Statement = [
-      {
-        Effect = "Allow",
-        Action = [
-          "ec2:AssociateAddress",
-          "ec2:DisassociateAddress",
-          "ec2:DescribeAddresses",
-          "ec2:DescribeInstances"
-        ],
-        Resource = "*"
-      }
-    ]
-  })
-}
-
+# Instance profile that exposes SSM access to the instance
 resource "aws_iam_instance_profile" "mc" {
   name = "${var.name_prefix}-ec2-prof"
   role = aws_iam_role.mc.name
@@ -137,7 +95,6 @@ resource "aws_launch_template" "mc" {
   }
 
   user_data = base64encode(templatefile("${path.module}/userdata.sh.tftpl", {
-    name_prefix                       = var.name_prefix
     mc_version                         = var.mc_version
     java_heap                          = var.java_heap
     view_distance                      = var.view_distance
@@ -151,9 +108,6 @@ resource "aws_launch_template" "mc" {
     data_volume_enabled                = var.data_volume_enabled
     data_volume_id                     = var.data_volume_id
     data_volume_device_name            = var.data_volume_device_name
-
-    eip_enabled                        = var.eip_enabled
-    eip_allocation_id                  = var.eip_allocation_id
   }))
 
   tag_specifications {

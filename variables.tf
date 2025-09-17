@@ -67,29 +67,21 @@ variable "name_prefix" {
 }
 
 
-# ---- ASG sizing ----
-variable "asg_min_size" {
-  description = "Minimum number of instances in the ASG"
+# ---- Runtime EC2 instance management ----
+variable "instance_count" {
+  description = "Number of EC2 instances to launch (set to 0 to disable)"
   type        = number
   default     = 0
+  validation {
+    condition     = var.instance_count >= 0 && var.instance_count <= 1
+    error_message = "instance_count must be 0 or 1."
+  }
 }
 
-variable "asg_max_size" {
-  description = "Maximum number of instances in the ASG"
-  type        = number
-  default     = 1
-}
-
-variable "asg_desired_capacity" {
-  description = "Desired number of instances in the ASG"
-  type        = number
-  default     = 0
-}
-
-# Explicit launch template version used by the ASG.
+# Explicit launch template version used for the managed instance(s).
 # Accepts a numeric version (e.g., "1") or special values like "$Latest" or "$Default".
-variable "asg_launch_template_version" {
-  description = "Launch template version for the ASG (e.g., \"1\", \"$Latest\", or \"$Default\")."
+variable "instance_launch_template_version" {
+  description = "Launch template version for the managed instances (e.g., \"1\", \"$Latest\", or \"$Default\")."
   type        = string
   default     = "$Latest"
 }
@@ -132,7 +124,7 @@ variable "data_volume_device_name" {
 }
 
 
- 
+
 
 
 # ---- Optional Elastic IP (stable public IP) ----

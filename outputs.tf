@@ -3,14 +3,9 @@ output "ami_id" {
   value       = module.image_builder.ami_id
 }
 
-output "asg_name" {
-  description = "Auto Scaling group name"
-  value       = module.asg.name
-}
-
 output "instance_ids" {
-  description = "Instance IDs in the ASG (running)"
-  value       = data.aws_instances.mc.ids
+  description = "Managed EC2 instance IDs"
+  value       = module.ec2_instance.instance_ids
 }
 
 output "data_volume_id" {
@@ -26,4 +21,14 @@ output "eip_public_ip" {
 output "launch_template_latest_version" {
   description = "Launch template latest version"
   value       = module.launch_template.launch_template_latest_version
+}
+
+output "instance_private_ips" {
+  description = "Private IP addresses of managed instances"
+  value       = module.ec2_instance.private_ips
+}
+
+output "instance_public_ips" {
+  description = "Public IP addresses of managed instances"
+  value       = module.ec2_instance.public_ips
 }
