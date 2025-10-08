@@ -1,6 +1,6 @@
 terraform {
   backend "s3" {
-    key    = "state.tfstate"
+    key    = "minecraft/state.tfstate"
     region = "us-east-2"
   }
 }
