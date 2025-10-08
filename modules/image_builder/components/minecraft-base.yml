@@ -63,18 +63,60 @@ phases:
             content: |
               #!/usr/bin/env bash
               set -euo pipefail
+     
               APP_DIR=/opt/mc-app
               MC_DIR=/opt/minecraft
+     
               # Load runtime overrides (version, heap, flags)
               if [ -f /etc/minecraft/minecraft.env ]; then
                 set -a; . /etc/minecraft/minecraft.env; set +a
               fi
+     
               : "${MC_VERSION:=1.21.8}"
-              : "${JAVA_HEAP:=2G}"
-              : "${AIKAR_FLAGS:=-XX:+UnlockExperimentalVMOptions -XX:+UseG1GC -XX:G1NewSizePercent=30 -XX:G1MaxNewSizePercent=40 -XX:G1HeapRegionSize=8M -XX:G1ReservePercent=20 -XX:MaxGCPauseMillis=200 -XX:G1MixedGCCountTarget=4 -XX:G1MixedGCLiveThresholdPercent=90 -XX:InitiatingHeapOccupancyPercent=15 -XX:G1RSetUpdatingPauseTimePercent=5 -XX:SurvivorRatio=32 -XX:+PerfDisableSharedMem -XX:MaxTenuringThreshold=1}"
-              # EULA must be accepted in the data dir
-              [ -f "$MC_DIR/eula.txt" ] || echo "eula=true" > "$MC_DIR/eula.txt"
-              exec /usr/bin/java -Xms${JAVA_HEAP} -Xmx${JAVA_HEAP} ${AIKAR_FLAGS} -jar "$APP_DIR/server.jar" nogui
+     
+              # Heap sizing:
+              # - If JAVA_HEAP (e.g. "2G") is set, use it for both Xms/Xmx.
+              # - Else default to Xms=2G, Xmx=2500M for t4g.medium.
+              if [ -n "${JAVA_HEAP:-}" ]; then
+                JAVA_HEAP_MIN="$JAVA_HEAP"
+                JAVA_HEAP_MAX="$JAVA_HEAP"
+              else
+                JAVA_HEAP_MIN="${JAVA_HEAP_MIN:-2G}"
+                JAVA_HEAP_MAX="${JAVA_HEAP_MAX:-2500M}"
+              fi
+     
+              # JVM flags:
+              # Use lean modern G1 defaults unless AIKAR_FLAGS is explicitly provided.
+              if [ -n "${AIKAR_FLAGS:-}" ]; then
+                # shellcheck disable=SC2206
+                JVM_FLAGS=(${AIKAR_FLAGS})
+              else
+                JVM_FLAGS=(
+                  -XX:+UseG1GC
+                  -XX:+ParallelRefProcEnabled
+                  -XX:MaxGCPauseMillis=100
+                  -XX:+UseStringDeduplication
+                  -XX:+AlwaysPreTouch
+                  -XX:+ExitOnOutOfMemoryError
+                  -Dfile.encoding=UTF-8
+                  -Xlog:gc*:file=logs/gc.log:time,uptime,level,tid:filecount=5,filesize=10M
+                )
+              fi
+     
+              # Prep writable paths in the data dir
+              mkdir -p "$MC_DIR/logs"
+              [[ -f "$MC_DIR/eula.txt" ]] || echo "eula=true" > "$MC_DIR/eula.txt"
+     
+              # Allow many files/plugins
+              ulimit -n 65535 || true
+     
+              # Ensure worlds/configs/logs land in MC_DIR
+              cd "$MC_DIR"
+     
+              exec /usr/bin/java \
+                -Xms"${JAVA_HEAP_MIN}" -Xmx"${JAVA_HEAP_MAX}" \
+                "${JVM_FLAGS[@]}" \
+                -jar "$APP_DIR/server.jar" nogui
       - name: write_systemd
         action: CreateFile
         inputs:
