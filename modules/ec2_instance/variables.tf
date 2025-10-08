@@ -24,12 +24,6 @@ variable "instance_count" {
   }
 }
 
-variable "data_volume_enabled" {
-  description = "Whether to attach the persistent data volume"
-  type        = bool
-  default     = false
-}
-
 variable "data_volume_id" {
   description = "Persistent data volume ID to attach"
   type        = string
@@ -40,12 +34,6 @@ variable "data_volume_device_name" {
   description = "Device name to expose the persistent data volume"
   type        = string
   default     = "/dev/sdf"
-}
-
-variable "eip_enabled" {
-  description = "Whether to associate an Elastic IP"
-  type        = bool
-  default     = false
 }
 
 variable "eip_allocation_id" {

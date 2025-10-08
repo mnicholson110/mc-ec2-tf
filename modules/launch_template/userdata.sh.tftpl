@@ -20,7 +20,7 @@ systemctl stop minecraft || true
 # Ensure data dir mountpoint exists (world/configs live here)
 install -d -o minecraft -g minecraft -m 0755 /opt/minecraft
 
-if [[ "${data_volume_enabled}" == "true" && -n "${data_volume_id}" ]]; then
+if [[ -n "${data_volume_id}" ]]; then
   DEV_SYMLINK="/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_${data_volume_id}"
   ATTACH_DEV=""
   for i in {1..60}; do
@@ -103,10 +103,6 @@ fi
 chown minecraft:minecraft /opt/minecraft/server.properties || true
 
 
-#!/bin/bash
-set -euxo pipefail
-
-
 # Pre-seed or reconcile ops.json and whitelist.json on boot
 # Inputs are provided as JSON arrays via template variables
 OPS_NAMES_JSON='${ops_usernames_json}'
@@ -146,9 +142,13 @@ if [[ "$${WL_NAMES_JSON}" != "[]" ]]; then
   done < <(jq -r '.[]' <<<"$WL_NAMES_JSON")
 fi
 
-# Replace whitelist.json with desired (always write, even if empty) when whitelist toggled true
 if [[ "${whitelist}" == "true" ]]; then
-  mv "$DESIRED_WL_TMP" /opt/minecraft/whitelist.json
+  if [[ "$${WL_NAMES_JSON}" != "[]" ]]; then
+    mv "$DESIRED_WL_TMP" /opt/minecraft/whitelist.json
+  else
+    rm -f "$DESIRED_WL_TMP" || true
+    [ -f /opt/minecraft/whitelist.json ] || echo "[]" > /opt/minecraft/whitelist.json
+  fi
   chown minecraft:minecraft /opt/minecraft/whitelist.json || true
 else
   rm -f "$DESIRED_WL_TMP" || true
@@ -173,76 +173,36 @@ mv "$DESIRED_OPS_TMP" /opt/minecraft/ops.json
 chown minecraft:minecraft /opt/minecraft/ops.json || true
 
 
-# Ensure application binaries live outside the data mount and override systemd
-# App dir contains server.jar and launch script; data stays under /opt/minecraft
-install -d -o minecraft -g minecraft -m 0755 /opt/mc-app
-cat > /opt/mc-app/launch.sh <<'EOF_LAUNCH'
-#!/usr/bin/env bash
-set -euo pipefail
-APP_DIR=/opt/mc-app
-MC_DIR=/opt/minecraft
-UA="mc-ec2-userdata/1.0 ([email protected])"
-
-# Load runtime overrides (version, heap, flags)
-if [ -f /etc/minecraft/minecraft.env ]; then
-  set -a; . /etc/minecraft/minecraft.env; set +a
-fi
-: "$${MC_VERSION:=1.21.8}"
-: "$${JAVA_HEAP:=2G}"
-: "$${AIKAR_FLAGS:=-XX:+UnlockExperimentalVMOptions -XX:+UseG1GC -XX:G1NewSizePercent=30 -XX:G1MaxNewSizePercent=40 -XX:G1HeapRegionSize=8M -XX:G1ReservePercent=20 -XX:MaxGCPauseMillis=200 -XX:G1MixedGCCountTarget=4 -XX:G1MixedGCLiveThresholdPercent=90 -XX:InitiatingHeapOccupancyPercent=15 -XX:G1RSetUpdatingPauseTimePercent=5 -XX:SurvivorRatio=32 -XX:+PerfDisableSharedMem -XX:MaxTenuringThreshold=1}"
-
-mkdir -p "$APP_DIR" "$MC_DIR"
-
-resolve_paper_url() {
-  local ver="$1"
-  local url=""
-  # Try requested version first
-  url=$(curl -fsSL -H "User-Agent: $UA" "https://fill.papermc.io/v3/projects/paper/versions/$ver/builds" \
-        | jq -r 'first(.[] | select(.channel=="STABLE") | .downloads."server:default".url) // empty' || true)
-  if [[ -z "$url" ]]; then
-    # Fallback: get latest listed version then pick latest stable build
-    latest_ver=$(curl -fsSL -H "User-Agent: $UA" "https://fill.papermc.io/v3/projects/paper" | jq -r '.versions[-1] // empty' || true)
-    if [[ -n "$latest_ver" ]]; then
-      url=$(curl -fsSL -H "User-Agent: $UA" "https://fill.papermc.io/v3/projects/paper/versions/$latest_ver/builds" \
-            | jq -r 'first(.[] | select(.channel=="STABLE") | .downloads."server:default".url) // empty' || true)
-      echo "Using latest available Paper version: $latest_ver" >&2
+# Fallback: if AMI didn’t bake the jar for some reason, fetch it once
+if [ ! -f /opt/mc-app/server.jar ]; then
+  UA="mc-ec2-userdata/1.0 ([email protected])"
+  # Load runtime overrides (version)
+  if [ -f /etc/minecraft/minecraft.env ]; then
+    set -a; . /etc/minecraft/minecraft.env; set +a
+  fi
+  : "$${MC_VERSION:=1.21.8}"
+  mkdir -p /opt/mc-app
+  resolve_paper_url() {
+    local ver="$1"
+    local url=""
+    url=$(curl -fsSL -H "User-Agent: $UA" "https://fill.papermc.io/v3/projects/paper/versions/$ver/builds" \
+          | jq -r 'first(.[] | select(.channel=="STABLE") | .downloads."server:default".url) // empty' || true)
+    if [[ -z "$url" ]]; then
+      latest_ver=$(curl -fsSL -H "User-Agent: $UA" "https://fill.papermc.io/v3/projects/paper" | jq -r '.versions[-1] // empty' || true)
+      if [[ -n "$latest_ver" ]]; then
+        url=$(curl -fsSL -H "User-Agent: $UA" "https://fill.papermc.io/v3/projects/paper/versions/$latest_ver/builds" \
+              | jq -r 'first(.[] | select(.channel=="STABLE") | .downloads."server:default".url) // empty' || true)
+      fi
     fi
+    echo -n "$url"
+  }
+  URL=$(resolve_paper_url "$${MC_VERSION}")
+  if [[ -n "$URL" ]]; then
+    curl -fSL -H "User-Agent: $UA" -o /opt/mc-app/server.jar "$URL"
+    chmod 0644 /opt/mc-app/server.jar
   fi
-  echo -n "$url"
-}
-
-# Download Paper server.jar (stable build) into app dir if missing
-if [ ! -f "$APP_DIR/server.jar" ]; then
-  URL=$(resolve_paper_url "$MC_VERSION")
-  if [[ -z "$URL" ]]; then
-    echo "ERROR: Could not resolve Paper download URL for version '$MC_VERSION' or latest." >&2
-    exit 1
-  fi
-  curl -fSL -H "User-Agent: $UA" -o "$APP_DIR/server.jar" "$URL"
 fi
 
-# Accept EULA in data dir
-[ -f "$MC_DIR/eula.txt" ] || echo "eula=true" > "$MC_DIR/eula.txt"
-
-# Run with working directory set by systemd to $MC_DIR
-exec /usr/bin/java -Xms$${JAVA_HEAP} -Xmx$${JAVA_HEAP} $${AIKAR_FLAGS} -jar "$APP_DIR/server.jar" nogui
-EOF_LAUNCH
-chmod 0755 /opt/mc-app/launch.sh
-chown minecraft:minecraft /opt/mc-app/launch.sh
-
-# Systemd drop-in to point ExecStart to /opt/mc-app and ensure correct working dir
-install -d -m 0755 /etc/systemd/system/minecraft.service.d
-cat > /etc/systemd/system/minecraft.service.d/override.conf <<'EOF_SD'
-[Service]
-WorkingDirectory=/opt/minecraft
-ExecStart=
-ExecStart=/opt/mc-app/launch.sh
-# Allow writes to both data and app directories under ProtectSystem=strict
-ReadWritePaths=/opt/minecraft /etc/minecraft /opt/mc-app
-EOF_SD
-
-# Ensure and (re)start the service after overrides and data prep
+# Ensure and (re)start the service after data prep
 systemctl daemon-reload
 systemctl enable --now minecraft || true
-sleep 2
-systemctl restart minecraft || true

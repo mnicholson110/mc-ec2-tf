@@ -59,18 +59,15 @@ resource "aws_launch_template" "mc" {
   image_id               = var.ami_id
   instance_type          = var.instance_type
   update_default_version = true
-  key_name               = var.key_name != "" ? var.key_name : null
 
   credit_specification {
     cpu_credits = "unlimited"
   }
 
   network_interfaces {
-    associate_public_ip_address = var.associate_public_ip
-    delete_on_termination       = true
-    subnet_id                   = var.subnet_id
-    private_ip_address          = var.private_ip_address != "" ? var.private_ip_address : null
-    security_groups             = [aws_security_group.mc.id]
+    delete_on_termination = true
+    subnet_id             = var.subnet_id
+    security_groups       = [aws_security_group.mc.id]
   }
 
   block_device_mappings {
@@ -95,19 +92,18 @@ resource "aws_launch_template" "mc" {
   }
 
   user_data = base64encode(templatefile("${path.module}/userdata.sh.tftpl", {
-    mc_version                         = var.mc_version
-    java_heap                          = var.java_heap
-    view_distance                      = var.view_distance
-    simulation_distance                = var.simulation_distance
-    whitelist                          = var.whitelist
-    enable_command_block               = var.enable_command_block
-    enable_rcon                        = var.enable_rcon
-    ops_usernames_json                 = jsonencode(var.ops_usernames)
-    whitelist_usernames_json           = jsonencode(var.whitelist_usernames)
-    server_properties_overrides_json   = jsonencode(var.server_properties_overrides)
-    data_volume_enabled                = var.data_volume_enabled
-    data_volume_id                     = var.data_volume_id
-    data_volume_device_name            = var.data_volume_device_name
+    mc_version                       = var.mc_version
+    java_heap                        = var.java_heap
+    view_distance                    = var.view_distance
+    simulation_distance              = var.simulation_distance
+    whitelist                        = var.whitelist
+    enable_command_block             = var.enable_command_block
+    enable_rcon                      = var.enable_rcon
+    ops_usernames_json               = jsonencode(var.ops_usernames)
+    whitelist_usernames_json         = jsonencode(var.whitelist_usernames)
+    server_properties_overrides_json = jsonencode(var.server_properties_overrides)
+    data_volume_id                   = var.data_volume_id
+    data_volume_device_name          = var.data_volume_device_name
   }))
 
   tag_specifications {

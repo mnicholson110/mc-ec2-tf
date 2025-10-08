@@ -10,7 +10,7 @@ phases:
             - |
               set -euxo pipefail
               dnf -y update
-              dnf -y install java-21-amazon-corretto-headless jq tar unzip logrotate awscli
+              dnf -y install java-21-amazon-corretto-headless jq logrotate
       - name: create_user_dirs
         action: ExecuteBash
         inputs:
@@ -27,18 +27,44 @@ phases:
               set -euxo pipefail
               # Ensure config dir exists so systemd ReadWritePaths for /etc/minecraft doesn't fail
               mkdir -p /etc/minecraft
+      - name: prepare_mc_app
+        action: ExecuteBash
+        inputs:
+          commands:
+            - |
+              set -euxo pipefail
+              mkdir -p /opt/mc-app
+              chown root:root /opt/mc-app
+              chmod 0755 /opt/mc-app
+      - name: download_paper_jar
+        action: ExecuteBash
+        inputs:
+          commands:
+            - |
+              set -euxo pipefail
+              UA="mc-ec2-imagebuilder/1.0 ([email protected])"
+              MC_VERSION="1.21.8"
+              # Resolve latest stable build for the pinned version
+              URL=$(curl -fsSL -H "User-Agent: $UA" "https://fill.papermc.io/v3/projects/paper/versions/${MC_VERSION}/builds" \
+                    | jq -r 'first(.[] | select(.channel=="STABLE") | .downloads."server:default".url) // empty')
+              if [[ -z "$URL" ]]; then
+                echo "Failed to resolve Paper URL for ${MC_VERSION}" >&2
+                exit 1
+              fi
+              curl -fSL -H "User-Agent: $UA" -o /opt/mc-app/server.jar "$URL"
+              chmod 0644 /opt/mc-app/server.jar
       - name: write_launch_script
         action: CreateFile
         inputs:
-          - path: /opt/minecraft/bin/launch.sh
+          - path: /opt/mc-app/launch.sh
             permissions: '0755'
             owner: root
             group: root
             content: |
               #!/usr/bin/env bash
               set -euo pipefail
+              APP_DIR=/opt/mc-app
               MC_DIR=/opt/minecraft
-              UA="mc-ec2-imagebuilder/1.0 ([email protected])"
               # Load runtime overrides (version, heap, flags)
               if [ -f /etc/minecraft/minecraft.env ]; then
                 set -a; . /etc/minecraft/minecraft.env; set +a
@@ -46,14 +72,9 @@ phases:
               : "${MC_VERSION:=1.21.8}"
               : "${JAVA_HEAP:=2G}"
               : "${AIKAR_FLAGS:=-XX:+UnlockExperimentalVMOptions -XX:+UseG1GC -XX:G1NewSizePercent=30 -XX:G1MaxNewSizePercent=40 -XX:G1HeapRegionSize=8M -XX:G1ReservePercent=20 -XX:MaxGCPauseMillis=200 -XX:G1MixedGCCountTarget=4 -XX:G1MixedGCLiveThresholdPercent=90 -XX:InitiatingHeapOccupancyPercent=15 -XX:G1RSetUpdatingPauseTimePercent=5 -XX:SurvivorRatio=32 -XX:+PerfDisableSharedMem -XX:MaxTenuringThreshold=1}"
-              mkdir -p "$MC_DIR"
-              # Download Paper server.jar (stable build) if missing
-              if [ ! -f "$MC_DIR/server.jar" ]; then
-                URL=$(curl -fsSL -H "User-Agent: $UA" "https://fill.papermc.io/v3/projects/paper/versions/${MC_VERSION}/builds" | jq -r 'first(.[] | select(.channel=="STABLE") | .downloads."server:default".url)')
-                curl -fSL -H "User-Agent: $UA" -o "$MC_DIR/server.jar" "$URL"
-              fi
+              # EULA must be accepted in the data dir
               [ -f "$MC_DIR/eula.txt" ] || echo "eula=true" > "$MC_DIR/eula.txt"
-              exec /usr/bin/java -Xms${JAVA_HEAP} -Xmx${JAVA_HEAP} ${AIKAR_FLAGS} -jar "$MC_DIR/server.jar" nogui
+              exec /usr/bin/java -Xms${JAVA_HEAP} -Xmx${JAVA_HEAP} ${AIKAR_FLAGS} -jar "$APP_DIR/server.jar" nogui
       - name: write_systemd
         action: CreateFile
         inputs:
@@ -70,7 +91,7 @@ phases:
               [Service]
               EnvironmentFile=-/etc/minecraft/minecraft.env
               WorkingDirectory=/opt/minecraft
-              ExecStart=/opt/minecraft/bin/launch.sh
+              ExecStart=/opt/mc-app/launch.sh
               Restart=always
               RestartSec=10
               SuccessExitStatus=0 1 143
@@ -109,10 +130,3 @@ phases:
                 missingok
                 copytruncate
               }
-      - name: enable_services
-        action: ExecuteBash
-        inputs:
-          commands:
-            - |
-              systemctl daemon-reload
-              systemctl enable minecraft || true

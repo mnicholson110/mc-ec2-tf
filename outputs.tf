@@ -22,13 +22,3 @@ output "launch_template_latest_version" {
   description = "Launch template latest version"
   value       = module.launch_template.launch_template_latest_version
 }
-
-output "instance_private_ips" {
-  description = "Private IP addresses of managed instances"
-  value       = module.ec2_instance.private_ips
-}
-
-output "instance_public_ips" {
-  description = "Public IP addresses of managed instances"
-  value       = module.ec2_instance.public_ips
-}

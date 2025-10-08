@@ -22,14 +22,14 @@ locals {
 }
 
 resource "aws_volume_attachment" "data" {
-  count       = var.data_volume_enabled && var.instance_count == 1 && var.data_volume_id != "" ? 1 : 0
+  count       = var.instance_count == 1 && var.data_volume_id != "" ? 1 : 0
   device_name = var.data_volume_device_name
   volume_id   = var.data_volume_id
   instance_id = local.primary_instance_id
 }
 
 resource "aws_eip_association" "mc" {
-  count         = var.eip_enabled && var.instance_count == 1 && var.eip_allocation_id != "" ? 1 : 0
+  count         = var.instance_count == 1 && var.eip_allocation_id != "" ? 1 : 0
   allocation_id = var.eip_allocation_id
   instance_id   = local.primary_instance_id
 }

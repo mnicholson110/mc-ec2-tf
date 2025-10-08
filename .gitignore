@@ -1,55 +1,11 @@
-# Terraform directories
-**/.terraform/*
-
-# Terraform state
-*.tfstate
-*.tfstate.*
+.terraform/
+terraform.tfstate
+terraform.tfstate.*
 crash.log
 crash.*.log
-
-# Terraform plans (binary)
+.tfplan
 *.tfplan
-*.plan
-plan.out
-
-# Sensitive variable files
-*.tfvars
-*.tfvars.json
-
-# Local overrides
-override.tf
-override.tf.json
-*_override.tf
-*_override.tf.json
-
-# Terragrunt cache
-**/.terragrunt-cache/*
-.terragrunt-cache
-
-# Local environment files
-.env
-.env.*
-.envrc
-.direnv/
-
-# Editor/OS junk
+backend.hcl
+*.tfbackend
 .DS_Store
 Thumbs.db
-*.swp
-*.swo
-*.tmp
-*.bak
-
-# IDE settings
-.vscode/
-!.vscode/extensions.json
-!.vscode/settings.json
-!.vscode/tasks.json
-!.vscode/launch.json
-.idea/
-
-# Logs
-*.log
-
-# Keep provider lock file in version control
-!.terraform.lock.hcl

@@ -18,15 +18,3 @@ variable "type" {
   type        = string
 }
 
-variable "iops" {
-  description = "IOPS for gp3/io1/io2 volumes (optional)"
-  type        = number
-  default     = 3000
-}
-
-variable "throughput" {
-  description = "Throughput (MiB/s) for gp3 volumes (optional)"
-  type        = number
-  default     = 125
-}
-

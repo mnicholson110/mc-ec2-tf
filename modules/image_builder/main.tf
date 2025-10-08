@@ -68,14 +68,14 @@ resource "aws_imagebuilder_infrastructure_configuration" "mc" {
 resource "aws_imagebuilder_component" "mc_base" {
   name     = "${var.name_prefix}-component"
   platform = "Linux"
-  version  = "1.0.2"
+  version  = "1.0.0"
   data     = file("${path.module}/components/minecraft-base.yml")
   tags     = local.tags
 }
 
 resource "aws_imagebuilder_image_recipe" "mc" {
   name         = "${var.name_prefix}-recipe"
-  version      = "1.0.1"
+  version      = "1.0.0"
   parent_image = data.aws_ssm_parameter.al2023_arm64.value
 
   component {
@@ -103,4 +103,3 @@ resource "aws_imagebuilder_image" "mc" {
 locals {
   baked_ami_id = try(element(tolist(aws_imagebuilder_image.mc.output_resources[0].amis), 0).image, null)
 }
-
