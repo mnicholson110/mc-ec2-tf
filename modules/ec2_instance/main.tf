@@ -12,6 +12,11 @@ resource "aws_instance" "mc" {
     version = var.launch_template_version
   }
 
+  # this is managed by LT above
+  lifecycle {
+    ignore_changes = [user_data]
+  }
+
   tags = merge(local.tags, {
     Name = "${var.name_prefix}-srv"
   })
