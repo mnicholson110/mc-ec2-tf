@@ -1,0 +1,369 @@
+#!/bin/bash
+set -euxo pipefail
+
+# Simple retry helper: retry <max_tries> <sleep_seconds> <cmd...>
+retry() {
+  local -r max="$1"; shift
+  local -r sleep_s="$1"; shift
+  local n=1
+  until "$@"; do
+    if (( n >= max )); then
+      return 1
+    fi
+    echo "WARN: command failed (attempt $n/$max): $*" >&2
+    sleep "$sleep_s"
+    n=$(( n + 1 ))
+  done
+}
+
+# Update base system and install requirements (tolerate transient repo hiccups)
+if ! retry 6 10 dnf -y -q update; then
+  echo "WARN: dnf update failed after retries; continuing" >&2
+fi
+retry 6 10 dnf -y -q install java-21-amazon-corretto-headless jq logrotate e2fsprogs
+
+# Ensure curl CLI is present without tripping curl/curl-minimal conflicts
+if ! command -v curl >/dev/null 2>&1; then
+  retry 3 5 dnf -y -q install curl-minimal || retry 3 5 dnf -y -q install curl || true
+fi
+# Make sure SSM agent is enabled/running (AL2023 ships it, but be explicit)
+systemctl enable --now amazon-ssm-agent 2>/dev/null || true
+
+# Create service user and directories
+id -u minecraft 2>/dev/null || useradd --system --home /opt/minecraft --shell /sbin/nologin minecraft
+install -d -o minecraft -g minecraft -m 0755 /opt/minecraft
+install -d -o minecraft -g minecraft -m 0755 /opt/minecraft/logs
+install -d -m 0755 /opt/mc-app
+install -d -m 0755 /etc/minecraft
+
+# Render environment for the service
+cat > /etc/minecraft/minecraft.env <<'EOF_ENV'
+MC_VERSION="${mc_version}"
+JAVA_HEAP="${java_heap}"
+# Aikar flags tuned for Paper on Java 21
+AIKAR_FLAGS="-XX:+UnlockExperimentalVMOptions -XX:+UseG1GC -XX:G1NewSizePercent=30 -XX:G1MaxNewSizePercent=40 -XX:G1HeapRegionSize=8M -XX:G1ReservePercent=20 -XX:MaxGCPauseMillis=200 -XX:G1MixedGCCountTarget=4 -XX:G1MixedGCLiveThresholdPercent=90 -XX:InitiatingHeapOccupancyPercent=15 -XX:G1RSetUpdatingPauseTimePercent=5 -XX:SurvivorRatio=32 -XX:+PerfDisableSharedMem -XX:MaxTenuringThreshold=1"
+EOF_ENV
+
+# Download Paper server jar (pick latest build for the requested version)
+UA="mc-ec2-userdata/1.0 ([email protected])"
+resolve_paper_url() {
+  local ver="$1"
+  local url=""
+  local data=""
+  local build="" name=""
+  # Prefer official API v2
+  data=$(curl -fsSL -H "User-Agent: $UA" "https://api.papermc.io/v2/projects/paper/versions/$ver/builds" || true)
+  if [[ -n "$data" ]]; then
+    build=$(jq -r '.builds | select(length>0) | max_by(.build).build // empty' <<<"$data" || true)
+    name=$(jq -r '.builds | select(length>0) | max_by(.build).downloads.application.name // empty' <<<"$data" || true)
+    if [[ -n "$build" && -n "$name" ]]; then
+      url="https://api.papermc.io/v2/projects/paper/versions/$ver/builds/$build/downloads/$name"
+    fi
+  fi
+  # Fallback to fill.papermc.io v2 (same schema)
+  if [[ -z "$url" ]]; then
+    data=$(curl -fsSL -H "User-Agent: $UA" "https://fill.papermc.io/v2/projects/paper/versions/$ver/builds" || true)
+    if [[ -n "$data" ]]; then
+      build=$(jq -r '.builds | select(length>0) | max_by(.build).build // empty' <<<"$data" || true)
+      name=$(jq -r '.builds | select(length>0) | max_by(.build).downloads.application.name // empty' <<<"$data" || true)
+      if [[ -n "$build" && -n "$name" ]]; then
+        url="https://fill.papermc.io/v2/projects/paper/versions/$ver/builds/$build/downloads/$name"
+      fi
+    fi
+  fi
+  echo -n "$url"
+}
+
+MC_VERSION="${mc_version}"
+PAPER_URL=$(resolve_paper_url "$MC_VERSION") || true
+if [[ -n "$PAPER_URL" ]]; then
+  retry 6 5 curl -fSL -H "User-Agent: $UA" -o /opt/mc-app/server.jar "$PAPER_URL"
+  chmod 0644 /opt/mc-app/server.jar
+fi
+
+# Launch script
+cat > /opt/mc-app/launch.sh <<'EOF_LAUNCH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP_DIR=/opt/mc-app
+MC_DIR=/opt/minecraft
+
+# Load runtime overrides (version, heap, flags)
+if [ -f /etc/minecraft/minecraft.env ]; then
+  set -a; . /etc/minecraft/minecraft.env; set +a
+fi
+
+: "$${MC_VERSION:=1.21.10}"
+
+# Heap sizing
+if [ -n "$${JAVA_HEAP:-}" ]; then
+  JAVA_HEAP_MIN="$JAVA_HEAP"
+  JAVA_HEAP_MAX="$JAVA_HEAP"
+else
+  JAVA_HEAP_MIN="$${JAVA_HEAP_MIN:-2G}"
+  JAVA_HEAP_MAX="$${JAVA_HEAP_MAX:-2500M}"
+fi
+
+# JVM flags
+if [ -n "$${AIKAR_FLAGS:-}" ]; then
+  # shellcheck disable=SC2206
+  JVM_FLAGS=($${AIKAR_FLAGS})
+else
+  JVM_FLAGS=(
+    -XX:+UseG1GC
+    -XX:+ParallelRefProcEnabled
+    -XX:MaxGCPauseMillis=100
+    -XX:+UseStringDeduplication
+    -XX:+AlwaysPreTouch
+    -XX:+ExitOnOutOfMemoryError
+    -Dfile.encoding=UTF-8
+    -Xlog:gc*:file=logs/gc.log:time,uptime,level,tid:filecount=5,filesize=10M
+  )
+fi
+
+mkdir -p "$MC_DIR/logs"
+[[ -f "$MC_DIR/eula.txt" ]] || echo "eula=true" > "$MC_DIR/eula.txt"
+
+ulimit -n 65535 || true
+
+cd "$MC_DIR"
+
+exec /usr/bin/java \
+  -Xms"$${JAVA_HEAP_MIN}" -Xmx"$${JAVA_HEAP_MAX}" \
+  "$${JVM_FLAGS[@]}" \
+  -jar "$APP_DIR/server.jar" nogui
+EOF_LAUNCH
+chmod 0755 /opt/mc-app/launch.sh
+
+# Systemd unit
+cat > /etc/systemd/system/minecraft.service <<'EOF_UNIT'
+[Unit]
+Description=Paper Minecraft Server
+After=network-online.target local-fs.target
+Wants=network-online.target
+RequiresMountsFor=/opt/minecraft
+
+[Service]
+EnvironmentFile=-/etc/minecraft/minecraft.env
+WorkingDirectory=/opt/minecraft
+ExecStart=/opt/mc-app/launch.sh
+Restart=always
+RestartSec=10
+SuccessExitStatus=0 1 143
+User=minecraft
+UMask=027
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ReadWritePaths=/opt/minecraft /etc/minecraft
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+EOF_UNIT
+
+# Logrotate
+cat > /etc/logrotate.d/minecraft <<'EOF_ROT'
+/opt/minecraft/logs/*.log {
+  daily
+  rotate 14
+  compress
+  missingok
+  copytruncate
+}
+EOF_ROT
+
+# Ensure service is not started before data mount is ready
+systemctl stop minecraft || true
+
+# Mount and prepare data volume if provided
+if [[ -n "${data_volume_id}" ]]; then
+  # Resolve attached EBS device. Prefer udev by-id symlink; fall back to scanning NVMe disks.
+  VOL_ID_NODASH="$(echo "${data_volume_id}" | tr -d '-')"
+  SYMLINKS=(
+    "/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_$${VOL_ID_NODASH}"
+    "/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_${data_volume_id}"
+  )
+  ATTACH_DEV=""
+  for i in {1..60}; do
+    for link in "$${SYMLINKS[@]}"; do
+      if [[ -e "$link" ]]; then
+        ATTACH_DEV=$(readlink -f "$link")
+        break 2
+      fi
+    done
+    if [[ -b "${data_volume_device_name}" ]]; then
+      ATTACH_DEV="${data_volume_device_name}"
+      break
+    fi
+    sleep 2
+    udevadm settle || true
+  done
+
+  # Final fallback: pick the first non-root NVMe disk (e.g., nvme1n1)
+  if [[ -z "$ATTACH_DEV" ]]; then
+    ROOT_SRC=$(findmnt -no SOURCE / || true)
+    ROOT_BASENAME=$${ROOT_SRC#/dev/}
+    ROOT_DISK=$${ROOT_BASENAME%%p*}
+    while IFS= read -r dev; do
+      if [[ $${dev##*/} != "$ROOT_DISK" ]]; then
+        ATTACH_DEV="$dev"
+        break
+      fi
+    done < <(lsblk -ndo NAME,TYPE | awk '$2=="disk" && $1 ~ /^nvme/ {print "/dev/"$1}')
+  fi
+
+  [[ -n "$ATTACH_DEV" ]] || ATTACH_DEV="${data_volume_device_name}"
+
+  if [[ -b "$ATTACH_DEV" ]]; then
+    if ! blkid -o value -s TYPE "$ATTACH_DEV" >/dev/null 2>&1; then
+      mkfs.ext4 -F "$ATTACH_DEV"
+    fi
+
+    VOL_UUID=$(blkid -o value -s UUID "$ATTACH_DEV")
+    grep -q "^UUID=$VOL_UUID" /etc/fstab || echo "UUID=$VOL_UUID /opt/minecraft ext4 defaults,nofail 0 2" >> /etc/fstab
+    mount -a || mount "$ATTACH_DEV" /opt/minecraft || true
+    chown -R minecraft:minecraft /opt/minecraft || true
+  else
+    echo "WARN: Device for data volume not present; skipping mount (ATTACH_DEV='$ATTACH_DEV')" >&2
+  fi
+fi
+
+# Initial server.properties if missing
+if [[ ! -f /opt/minecraft/server.properties ]]; then
+cat > /opt/minecraft/server.properties <<EOF_PROP
+online-mode=true
+enable-command-block=${enable_command_block}
+view-distance=${view_distance}
+simulation-distance=${simulation_distance}
+white-list=${whitelist}
+enforce-whitelist=${whitelist}
+enforce-secure-profile=true
+spawn-protection=16
+max-players=20
+enable-rcon=${enable_rcon}
+broadcast-console-to-ops=true
+allow-flight=false
+enable-status=true
+server-port=25565
+server-ip=
+level-name=world
+level-seed=
+hardcore=false
+pvp=true
+difficulty=normal
+gamemode=survival
+max-world-size=29999984
+sync-chunk-writes=true
+enable-jmx-monitoring=false
+EOF_PROP
+fi
+
+# Apply server.properties overrides if any (JSON map)
+OVERRIDES_JSON='${server_properties_overrides_json}'
+if [[ -n "$OVERRIDES_JSON" && "$OVERRIDES_JSON" != "{}" ]]; then
+  PROPS_FILE=/opt/minecraft/server.properties
+  while read -r line; do
+    k="$${line%%=*}"
+    v="$${line#*=}"
+    [[ -z "$k" ]] && continue
+    tmp=$(mktemp)
+    awk -v k="$k" -v v="$v" -F'=' '
+      BEGIN{OFS="="; found=0}
+      $1==k {print k, v; found=1; next}
+      {print}
+      END{ if (!found) print k"="v }
+    ' "$PROPS_FILE" > "$tmp" && mv "$tmp" "$PROPS_FILE"
+  done < <(jq -r 'to_entries[] | "\(.key)=\(.value)"' <<<"$OVERRIDES_JSON")
+fi
+chown minecraft:minecraft /opt/minecraft/server.properties || true
+
+# Build whitelist.json and ops.json
+OPS_NAMES_JSON='${ops_usernames_json}'
+WL_NAMES_JSON='${whitelist_usernames_json}'
+
+fetch_uuid() {
+  local name="$1"
+  local url="https://api.mojang.com/users/profiles/minecraft/$${name}"
+  local id
+  id=$(curl -fsSL --connect-timeout 5 --max-time 10 "$url" | jq -r '.id // empty' || true)
+  if [[ $${#id} -eq 32 ]]; then
+    echo -n "$${id:0:8}-$${id:8:4}-$${id:12:4}-$${id:16:4}-$${id:20:12}"
+  else
+    echo -n "$id"
+  fi
+}
+
+# Whitelist
+DESIRED_WL_TMP=$(mktemp)
+echo "[]" > "$DESIRED_WL_TMP"
+if [[ "$WL_NAMES_JSON" != "[]" ]]; then
+  while IFS= read -r name; do
+    [[ -z "$name" ]] && continue
+    uuid=$(fetch_uuid "$name") || true
+    if [[ -n "$uuid" ]]; then
+      t=$(mktemp)
+      jq --arg name "$name" --arg uuid "$uuid" '. + [{"uuid":$uuid,"name":$name}]' "$DESIRED_WL_TMP" > "$t" && mv "$t" "$DESIRED_WL_TMP"
+    else
+      echo "WARN: could not resolve UUID for whitelist name '$name'" >&2
+    fi
+  done < <(jq -r '.[]' <<<"$WL_NAMES_JSON")
+fi
+
+if [[ "${whitelist}" == "true" ]]; then
+  if [[ "$WL_NAMES_JSON" != "[]" ]]; then
+    mv "$DESIRED_WL_TMP" /opt/minecraft/whitelist.json
+  else
+    rm -f "$DESIRED_WL_TMP" || true
+    [ -f /opt/minecraft/whitelist.json ] || echo "[]" > /opt/minecraft/whitelist.json
+  fi
+  chown minecraft:minecraft /opt/minecraft/whitelist.json || true
+else
+  rm -f "$DESIRED_WL_TMP" || true
+fi
+
+# Ops
+DESIRED_OPS_TMP=$(mktemp)
+echo "[]" > "$DESIRED_OPS_TMP"
+if [[ "$OPS_NAMES_JSON" != "[]" ]]; then
+  while IFS= read -r name; do
+    [[ -z "$name" ]] && continue
+    uuid=$(fetch_uuid "$name") || true
+    if [[ -n "$uuid" ]]; then
+      t=$(mktemp)
+      jq --arg name "$name" --arg uuid "$uuid" '. + [{"uuid":$uuid,"name":$name,"level":4,"bypassesPlayerLimit":false}]' "$DESIRED_OPS_TMP" > "$t" && mv "$t" "$DESIRED_OPS_TMP"
+    else
+      echo "WARN: could not resolve UUID for ops name '$name'" >&2
+    fi
+  done < <(jq -r '.[]' <<<"$OPS_NAMES_JSON")
+fi
+mv "$DESIRED_OPS_TMP" /opt/minecraft/ops.json
+chown minecraft:minecraft /opt/minecraft/ops.json || true
+
+# Fallback: fetch jar if missing
+if [ ! -f /opt/mc-app/server.jar ]; then
+  URL=$(resolve_paper_url "$MC_VERSION")
+  if [[ -n "$URL" ]]; then
+    retry 6 5 curl -fSL -H "User-Agent: $UA" -o /opt/mc-app/server.jar "$URL"
+    chmod 0644 /opt/mc-app/server.jar
+  fi
+fi
+
+# If still missing, log and avoid restart loop
+if [ ! -f /opt/mc-app/server.jar ]; then
+  echo "ERROR: Paper server.jar could not be downloaded for version '$MC_VERSION'" >&2
+fi
+
+systemctl daemon-reload
+systemctl enable --now minecraft || true

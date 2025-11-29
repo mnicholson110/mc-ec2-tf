@@ -1,0 +1,11 @@
+.terraform/
+terraform.tfstate
+terraform.tfstate.*
+crash.log
+crash.*.log
+.tfplan
+*.tfplan
+backend.hcl
+*.tfbackend
+.DS_Store
+Thumbs.db
